@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>동영상 병합 프로그램</title>
+    <!-- SharedArrayBuffer 활성화를 위한 coi-serviceworker 로드 (COOP/COEP 헤더 자동 주입) -->
+    <script src="coi-serviceworker.min.js"></script>
+    <!-- FFmpeg.wasm 로드 -->
+    <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f4f7f6;
+            padding: 40px;
+            color: #333;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+        .upload-btn {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            cursor: pointer;
+            border-radius: 5px;
+            display: inline-block;
+        }
+        input[type="file"] {
+            display: none;
+        }
+        /* 드래그 앤 드롭 컨테이너 (실로 연결된 형태) */
+        .video-container {
+            display: flex;
+            align-items: center;
+            gap: 50px;
+            padding: 40px 20px;
+            overflow-x: auto;
+            min-height: 150px;
+            background: #fff;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+            margin-bottom: 30px;
+        }
+        .video-item {
+            width: 120px;
+            height: 80px;
+            background-color: #2c3e50;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 8px;
+            cursor: grab;
+            position: relative;
+            text-align: center;
+            font-size: 12px;
+            padding: 10px;
+            word-break: break-all;
+            flex-shrink: 0;
+            user-select: none;
+        }
+        .video-item:active {
+            cursor: grabbing;
+        }
+        .video-item .title {
+            background: rgba(0,0,0,0.6);
+            padding: 2px 5px;
+            border-radius: 4px;
+            pointer-events: none;
+            width: 90%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .delete-btn {
+            position: absolute;
+            top: -5px;
+            right: -5px;
+            background: #e74c3c;
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 22px;
+            height: 22px;
+            font-size: 12px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 10;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        }
+        .delete-btn:hover {
+            background: #c0392b;
+        }
+        /* 영상과 영상을 연결하는 '실' 디자인 */
+        .video-item:not(:last-child)::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            right: -50px;
+            width: 50px;
+            height: 4px;
+            background-color: #e74c3c; /* 붉은색 실선 */
+            transform: translateY(-50%);
+            z-index: 1;
+        }
+        .controls {
+            text-align: center;
+        }
+        .start-btn {
+            background-color: #e74c3c;
+            color: white;
+            border: none;
+            padding: 15px 40px;
+            font-size: 18px;
+            font-weight: bold;
+            border-radius: 30px;
+            cursor: pointer;
+            transition: 0.3s;
+        }
+        .start-btn:hover {
+            background-color: #c0392b;
+        }
+        .start-btn:disabled {
+            background-color: #95a5a6;
+            cursor: not-allowed;
+        }
+        #status {
+            margin-top: 15px;
+            font-weight: bold;
+            color: #2980b9;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h2>🎞️ 동영상 순서 맞추기 & 병합</h2>
+        <label class="upload-btn">
+            동영상 추가하기 (여러 개 선택 가능)
+            <input type="file" id="fileInput" multiple accept="video/*">
+        </label>
+    </div>
+
+    <!-- 영상들이 배치되고 실로 연결되는 영역 -->
+    <div class="video-container" id="videoContainer">
+        <!-- JS로 아이템이 추가됩니다 -->
+    </div>
+
+    <div class="controls">
+        <button class="start-btn" id="startBtn">▶ 동영상 병합</button>
+        <button class="start-btn" id="extractAudioBtn" style="background-color:#3498db; margin-left: 10px;">🎵 음성(MP3) 추출</button>
+        <div id="status"></div>
+    </div>
+
+    <script>
+        const fileInput = document.getElementById('fileInput');
+        const container = document.getElementById('videoContainer');
+        const startBtn = document.getElementById('startBtn');
+        const extractAudioBtn = document.getElementById('extractAudioBtn');
+        const statusTxt = document.getElementById('status');
+        
+        // 업로드된 파일들을 관리하는 Map (DOM 요소와 실제 파일 매핑)
+        let fileMap = new Map();
+
+        // 1. 파일 처리 로직 (공통)
+        function handleFiles(files) {
+            files.forEach(file => {
+                if (!file.type.startsWith('video/')) {
+                    alert(`${file.name}은(는) 동영상 파일이 아닙니다.`);
+                    return;
+                }
+                const id = 'vid_' + Math.random().toString(36).substr(2, 9);
+                fileMap.set(id, file);
+
+                const item = document.createElement('div');
+                item.className = 'video-item';
+                item.draggable = true;
+                item.id = id;
+                
+                // 파일 제목
+                const titleSpan = document.createElement('span');
+                titleSpan.className = 'title';
+                titleSpan.innerText = file.name;
+                item.appendChild(titleSpan);
+
+                // 삭제 버튼
+                const deleteBtn = document.createElement('button');
+                deleteBtn.className = 'delete-btn';
+                deleteBtn.innerHTML = '✕';
+                deleteBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    fileMap.delete(id);
+                    item.remove();
+                };
+                item.appendChild(deleteBtn);
+
+                // 썸네일 생성 로직
+                const videoURL = URL.createObjectURL(file);
+                const videoEl = document.createElement('video');
+                videoEl.src = videoURL;
+                videoEl.muted = true;
+                // 메타데이터 로드 후 시간 설정
+                videoEl.onloadedmetadata = () => {
+                    videoEl.currentTime = 1; // 1초 지점 캡처 시도
+                };
+                videoEl.onseeked = () => {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = videoEl.videoWidth;
+                    canvas.height = videoEl.videoHeight;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+                    item.style.backgroundImage = `url(${canvas.toDataURL('image/jpeg')})`;
+                    item.style.backgroundSize = 'cover';
+                    item.style.backgroundPosition = 'center';
+                    URL.revokeObjectURL(videoURL); // 메모리 해제
+                };
+
+                // 드래그 앤 드롭 이벤트 등록 (요소 재정렬)
+                item.addEventListener('dragstart', dragStart);
+                item.addEventListener('dragover', dragOver);
+                item.addEventListener('drop', drop);
+                item.addEventListener('dragenter', dragEnter);
+
+                container.appendChild(item);
+            });
+        }
+
+        // 파일 업로드 버튼 이벤트
+        fileInput.addEventListener('change', (e) => {
+            const files = Array.from(e.target.files);
+            handleFiles(files);
+            fileInput.value = ''; // 초기화
+        });
+
+        // 외부 파일 드래그 앤 드롭 이벤트 (화면 전체)
+        let dragCounter = 0;
+
+        window.addEventListener('dragenter', (e) => {
+            e.preventDefault();
+            if (e.dataTransfer.types.includes('Files')) {
+                dragCounter++;
+                document.body.style.backgroundColor = '#e8f4f8'; // 드래그 시 배경색 변경
+            }
+        });
+
+        window.addEventListener('dragover', (e) => {
+            e.preventDefault(); // 드롭 허용을 위해 필수
+        });
+
+        window.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            if (e.dataTransfer.types.includes('Files')) {
+                dragCounter--;
+                if (dragCounter === 0) {
+                    document.body.style.backgroundColor = ''; // 배경색 복구
+                }
+            }
+        });
+
+        window.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dragCounter = 0;
+            document.body.style.backgroundColor = '';
+            if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                const files = Array.from(e.dataTransfer.files);
+                handleFiles(files);
+            }
+        });
+
+        // 2. 드래그 앤 드롭 로직
+        let draggedItem = null;
+
+        function dragStart(e) {
+            draggedItem = this;
+            e.dataTransfer.effectAllowed = 'move';
+        }
+
+        function dragOver(e) {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+        }
+
+        function dragEnter(e) {
+            e.preventDefault();
+        }
+
+        function drop(e) {
+            e.stopPropagation();
+            if (draggedItem !== this) {
+                // 위치 교환 (간단한 드롭 로직)
+                const allItems = Array.from(container.querySelectorAll('.video-item'));
+                const draggedIndex = allItems.indexOf(draggedItem);
+                const targetIndex = allItems.indexOf(this);
+
+                if (draggedIndex < targetIndex) {
+                    this.after(draggedItem);
+                } else {
+                    this.before(draggedItem);
+                }
+            }
+            return false;
+        }
+
+        // 3. FFmpeg 동영상 병합 로직
+        const { createFFmpeg, fetchFile } = FFmpeg;
+        const ffmpeg = createFFmpeg({ log: true });
+
+        async function runFFmpegProcess(mode) {
+            const currentItems = Array.from(container.querySelectorAll('.video-item'));
+            if (mode === 'merge' && currentItems.length < 2) {
+                alert('병합하려면 2개 이상의 동영상이 필요합니다.');
+                return;
+            }
+            if (currentItems.length === 0) {
+                alert('동영상을 추가해주세요.');
+                return;
+            }
+
+            startBtn.disabled = true;
+            extractAudioBtn.disabled = true;
+            statusTxt.innerText = "FFmpeg 코어 로딩 중...";
+
+            try {
+                if (!ffmpeg.isLoaded()) {
+                    await ffmpeg.load();
+                }
+
+                statusTxt.innerText = "파일을 메모리에 쓰는 중...";
+                let concatListText = '';
+
+                // UI에 나열된 순서대로 파일 처리
+                for (let i = 0; i < currentItems.length; i++) {
+                    const id = currentItems[i].id;
+                    const file = fileMap.get(id);
+                    const fileName = `input_${i}.mp4`;
+                    
+                    ffmpeg.FS('writeFile', fileName, await fetchFile(file));
+                    concatListText += `file '${fileName}'\n`;
+                }
+
+                // FFmpeg concat demuxer를 위한 리스트 파일 생성
+                ffmpeg.FS('writeFile', 'list.txt', concatListText);
+
+                if (mode === 'merge') {
+                    statusTxt.innerText = "동영상 병합 중... (시간이 걸릴 수 있습니다)";
+                    await ffmpeg.run('-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', 'output.mp4');
+                    
+                    statusTxt.innerText = "병합 완료! 다운로드를 준비합니다.";
+                    const data = ffmpeg.FS('readFile', 'output.mp4');
+                    const videoBlob = new Blob([data.buffer], { type: 'video/mp4' });
+                    const url = URL.createObjectURL(videoBlob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'merged_video.mp4';
+                    a.click();
+                } else if (mode === 'audio') {
+                    statusTxt.innerText = "음성 추출 중... (시간이 걸릴 수 있습니다)";
+                    // 병합된 영상에서 음성만 mp3로 추출
+                    await ffmpeg.run('-f', 'concat', '-safe', '0', '-i', 'list.txt', '-vn', '-c:a', 'libmp3lame', '-q:a', '2', 'output.mp3');
+                    
+                    statusTxt.innerText = "추출 완료! 다운로드를 준비합니다.";
+                    const data = ffmpeg.FS('readFile', 'output.mp3');
+                    const audioBlob = new Blob([data.buffer], { type: 'audio/mpeg' });
+                    const url = URL.createObjectURL(audioBlob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'extracted_audio.mp3';
+                    a.click();
+                }
+
+                statusTxt.innerText = "다운로드가 시작되었습니다.";
+            } catch (error) {
+                console.error(error);
+                statusTxt.innerText = "오류가 발생했습니다. 콘솔을 확인해주세요.";
+            } finally {
+                startBtn.disabled = false;
+                extractAudioBtn.disabled = false;
+            }
+        }
+
+        startBtn.addEventListener('click', () => runFFmpegProcess('merge'));
+        extractAudioBtn.addEventListener('click', () => runFFmpegProcess('audio'));
+    </script>
+</body>
+</html>
